@@ -170,7 +170,8 @@
         <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
           <div>
             <h2 class="text-base font-bold text-slate-900">Daily UPSC News Radio</h2>
-            <p class="text-xs text-slate-500">Listen to GS I–IV current affairs updates with constitutional &amp; Mains/Prelims explanations.</p>
+            <div id="radioHeaderDate" class="inline-flex items-center gap-1.5 mt-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-800">Loading date...</div>
+            <p class="text-xs text-slate-500 mt-1">Listen to GS I–IV current affairs updates with constitutional &amp; Mains/Prelims explanations.</p>
           </div>
           <div class="flex items-center gap-2">
             <label for="radioSpeed" class="text-xs font-semibold text-slate-600">Pace:</label>
@@ -184,12 +185,15 @@
 
         <div class="flex flex-col sm:flex-row gap-2">
           <input id="radioTopicInput" type="text" placeholder="Enter today's news topics or leave blank for a full UPSC daily briefing..." class="flex-1 px-3 py-2 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-          <div class="flex gap-2">
+          <div class="flex flex-wrap gap-2">
             <button id="btnGenRadio" type="button" class="px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold bg-indigo-600 text-white hover:bg-indigo-700">
               Generate Briefing
             </button>
             <button id="btnSampleRadio" type="button" class="px-3 py-2 rounded-xl text-xs sm:text-sm font-semibold bg-slate-100 text-slate-700 hover:bg-slate-200">
               Sample Radio
+            </button>
+            <button id="btnDownloadRadioTop" type="button" class="px-3 py-2 rounded-xl text-xs sm:text-sm font-semibold bg-emerald-600 text-white hover:bg-emerald-700">
+              Download Offline
             </button>
           </div>
         </div>
@@ -217,9 +221,19 @@
               <button id="btnRadioStop" type="button" class="px-3 py-1.5 rounded-lg bg-white/15 text-white text-xs font-semibold hover:bg-white/25">
                 Stop
               </button>
+              <button id="btnDownloadRadio" type="button" class="px-3 py-1.5 rounded-lg bg-emerald-500 text-white text-xs font-semibold hover:bg-emerald-400">
+                Download
+              </button>
             </div>
           </div>
-          <div id="radioStatusLine" class="text-xs text-indigo-200">Press Play to listen at 0.95x pace.</div>
+          <div class="flex flex-wrap items-center justify-between gap-2 pt-1">
+            <div id="radioStatusLine" class="text-xs text-indigo-200">Press Play to listen at 0.95x pace.</div>
+            <label class="inline-flex items-center gap-1.5 text-xs text-indigo-200 cursor-pointer">
+              <input id="chkKeepAwake" type="checkbox" checked class="rounded border-indigo-400" />
+              <span>Keep screen awake</span>
+            </label>
+          </div>
+          <audio id="bgKeepAliveAudio" loop class="hidden"></audio>
         </div>
       </div>
 
@@ -369,6 +383,9 @@
           if (parsedRadio && typeof parsedRadio === 'object') radioArchive = parsedRadio;
         }
       } catch (e) {}
+      const { todayStr, rangeLabel } = getLastTwoDays();
+      const hdrDateEl = document.getElementById('radioHeaderDate');
+      if (hdrDateEl) hdrDateEl.textContent = `Today: ${todayStr} · Window: ${rangeLabel}`;
       updateApiBadge();
       renderChecklistAll();
       renderRadioArchiveSelect();
@@ -564,7 +581,14 @@
       throw new Error(lastErr);
     }
 
-    async function fetchLastTwoDaysRssNews() {
+    function getLastOneMonth() {
+      const now = new Date();
+      const ago = new Date(now.getTime() - 30 * 86400000);
+      const fmt = (d) => d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+      return { todayStr: fmt(now), agoStr: fmt(ago), rangeLabel: `${fmt(ago)} – ${fmt(now)}` };
+    }
+
+    async function fetchLastTwoDaysRssNews(daysWindow = 2) {
       const feeds = [
         { name: 'PIB (Govt of India)', url: 'https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=3' },
         { name: 'PRS India (Parliament & Bills)', url: 'https://prsindia.org/rss.xml' },
@@ -575,30 +599,54 @@
         { name: 'Indian Express (Explained)', url: 'https://indianexpress.com/section/explained/feed/' },
         { name: 'Indian Express (India)', url: 'https://indianexpress.com/section/india/feed/' }
       ];
-      const cutoff = Date.now() - 2 * 86400000;
-      const items = [];
+      const cutoff = Date.now() - daysWindow * 86400000;
+      const recentItems = [];
+      const fallbackItems = [];
       const sources = [];
       const seenLinks = new Set();
+
+      const pushEntry = (sourceName, title, desc, link, pubDateStr) => {
+        if (!title || !link || seenLinks.has(link)) return;
+        seenLinks.add(link);
+        const parsedTs = Date.parse(pubDateStr || '');
+        const ts = isNaN(parsedTs) ? Date.now() : parsedTs;
+        const cleanDesc = String(desc || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 260);
+        const dateLabel = new Date(ts).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+        const obj = { source: sourceName, date: dateLabel, title: String(title).trim(), desc: cleanDesc, link, ts };
+        if (ts >= cutoff) recentItems.push(obj);
+        else fallbackItems.push(obj);
+      };
 
       await Promise.all(feeds.map(async (f) => {
         try {
           const res = await fetch(`https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(f.url)}`);
-          if (!res.ok) return;
-          const data = await res.json();
-          (data.items || []).forEach((it) => {
-            const ts = Date.parse(it.pubDate || '');
-            if (!isNaN(ts) && ts >= cutoff && !seenLinks.has(it.link)) {
-              seenLinks.add(it.link);
-              const cleanDesc = String(it.description || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 260);
-              const dateLabel = new Date(ts).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
-              items.push({ source: f.name, date: dateLabel, title: it.title, desc: cleanDesc, link: it.link, ts });
+          if (res.ok) {
+            const data = await res.json();
+            if (data && Array.isArray(data.items) && data.items.length) {
+              data.items.forEach((it) => pushEntry(f.name, it.title, it.description, it.link, it.pubDate));
+              return;
             }
-          });
+          }
+        } catch (e) {}
+        try {
+          const res2 = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(f.url)}`);
+          if (res2.ok) {
+            const xmlText = await res2.text();
+            const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
+            Array.from(doc.querySelectorAll('item')).slice(0, 6).forEach((el) => {
+              const t = el.querySelector('title')?.textContent;
+              const l = el.querySelector('link')?.textContent;
+              const d = el.querySelector('description')?.textContent;
+              const p = el.querySelector('pubDate')?.textContent;
+              pushEntry(f.name, t, d, l, p);
+            });
+          }
         } catch (e) {}
       }));
 
-      items.sort((a, b) => b.ts - a.ts);
-      const top = items.slice(0, 12);
+      recentItems.sort((a, b) => b.ts - a.ts);
+      fallbackItems.sort((a, b) => b.ts - a.ts);
+      const top = (recentItems.length >= 5 ? recentItems : recentItems.concat(fallbackItems)).slice(0, 20);
       top.forEach((x) => sources.push({ title: `${x.source} (${x.date})`, uri: x.link }));
       const articlesText = top.map((x, i) => `${i + 1}. [${x.date}] (${x.source}) ${x.title} — ${x.desc}`).join('\n');
       return { articlesText, sources, rawItems: top };
@@ -684,10 +732,10 @@
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span> Generating...';
       try {
-        const { todayStr, yesterdayStr, rangeLabel } = getLastTwoDays();
-        const { articlesText, sources } = await fetchLastTwoDaysRssNews();
-        const newsBlock = articlesText ? `\n\nLIVE LAST-2-DAYS NEWS FEED (${rangeLabel}):\n${articlesText}` : '';
-        const prompt = `Generate a 20-question UPSC CSE Prelims GS Paper I mock set${theme ? ` focused on "${theme}"` : ''} blending the live last-2-days current affairs below (${yesterdayStr} to ${todayStr}) with static UPSC PYQ-style questions (multi-statement, Statement-I/II, "how many pairs" elimination).${newsBlock}
+        const { todayStr, agoStr, rangeLabel } = getLastOneMonth();
+        const { articlesText, sources } = await fetchLastTwoDaysRssNews(30);
+        const newsBlock = articlesText ? `\n\nLIVE LAST-30-DAYS NEWS FEED (${rangeLabel}):\n${articlesText}` : '';
+        const prompt = `Generate a 20-question UPSC CSE Prelims GS Paper I mock set${theme ? ` focused on "${theme}"` : ''} blending current affairs from NOT MORE THAN 1 MONTH (${agoStr} to ${todayStr} ONLY — DO NOT include news older than 1 month) with static UPSC PYQ-style questions (multi-statement, Statement-I/II, "how many pairs" elimination).${newsBlock}
 For each question, include a "date" field showing the exact news date (${todayStr} or ${yesterdayStr}) for current affairs items, or "Static / PYQ" for static items.
 Return ONLY valid JSON array of 20 objects:
 [{"date":"${todayStr}","tag":"Polity / Current Affairs","q":"...","options":["A. ...","B. ...","C. ...","D. ..."],"answerIndex":0,"explanation":"..."}]`;
@@ -731,9 +779,116 @@ Return ONLY valid JSON array of 20 objects:
       showToast('Loaded sample UPSC Prelims questions.');
     }
 
-    // --- DAILY NEWS RADIO ---
+    // --- DAILY NEWS RADIO (BACKGROUND KEEP-ALIVE + MEDIA SESSION + CHUNKED TTS) ---
+    let radioWakeLock = null;
+    let radioQueue = [];
+    let radioQueueIdx = 0;
+    let radioIsPlaying = false;
+
+    function buildSilentWavUrl() {
+      // 1-second silent PCM WAV data URI so mobile browsers register active media playback
+      const sampleRate = 8000, numSamples = 8000;
+      const buf = new ArrayBuffer(44 + numSamples);
+      const v = new DataView(buf);
+      const wr = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+      wr(0, 'RIFF'); v.setUint32(4, 36 + numSamples, true); wr(8, 'WAVE');
+      wr(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+      v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
+      wr(36, 'data'); v.setUint32(40, numSamples, true);
+      for (let i = 0; i < numSamples; i++) v.setUint8(44 + i, 128);
+      return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+    }
+
+    async function acquireWakeLock() {
+      const chk = document.getElementById('chkKeepAwake');
+      if (chk && chk.checked && 'wakeLock' in navigator) {
+        try { radioWakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+      }
+    }
+
+    function releaseWakeLock() {
+      if (radioWakeLock) {
+        try { radioWakeLock.release(); } catch (e) {}
+        radioWakeLock = null;
+      }
+    }
+
+    function startBgAudioAndMediaSession() {
+      const audio = document.getElementById('bgKeepAliveAudio');
+      if (audio) {
+        if (!audio.src) audio.src = buildSilentWavUrl();
+        audio.play().catch(() => {});
+      }
+      if ('mediaSession' in navigator) {
+        try {
+          navigator.mediaSession.metadata = new MediaMetadata({
+            title: document.getElementById('radioHeadline').textContent || 'UPSC Daily News Radio',
+            artist: 'UPSC · LBSNAA 2027',
+            album: document.getElementById('radioDateBadge').textContent || 'Daily Briefing',
+            artwork: [{ src: 'icon-192.png', sizes: '192x192', type: 'image/png' }]
+          });
+          navigator.mediaSession.playbackState = 'playing';
+          navigator.mediaSession.setActionHandler('play', () => playRadioScript());
+          navigator.mediaSession.setActionHandler('pause', () => pauseRadioScript());
+          navigator.mediaSession.setActionHandler('stop', () => stopSpeech());
+        } catch (e) {}
+      }
+      acquireWakeLock();
+    }
+
+    function stopBgAudioAndMediaSession() {
+      const audio = document.getElementById('bgKeepAliveAudio');
+      if (audio) { try { audio.pause(); } catch (e) {} }
+      if ('mediaSession' in navigator) {
+        try { navigator.mediaSession.playbackState = 'none'; } catch (e) {}
+      }
+      releaseWakeLock();
+    }
+
+    function pauseRadioScript() {
+      radioIsPlaying = false;
+      if ('speechSynthesis' in window) window.speechSynthesis.pause();
+      if ('mediaSession' in navigator) {
+        try { navigator.mediaSession.playbackState = 'paused'; } catch (e) {}
+      }
+      document.getElementById('radioStatusLine').textContent = 'Paused.';
+    }
+
     function stopSpeech() {
+      radioIsPlaying = false;
+      radioQueue = [];
+      radioQueueIdx = 0;
       if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+      stopBgAudioAndMediaSession();
+      const st = document.getElementById('radioStatusLine');
+      if (st) st.textContent = 'Stopped.';
+    }
+
+    function speakNextChunk() {
+      if (!radioIsPlaying || radioQueueIdx >= radioQueue.length) {
+        if (radioIsPlaying) {
+          radioIsPlaying = false;
+          stopBgAudioAndMediaSession();
+          document.getElementById('radioStatusLine').textContent = 'Briefing finished.';
+        }
+        return;
+      }
+      const chunk = radioQueue[radioQueueIdx];
+      const utter = new SpeechSynthesisUtterance(chunk);
+      utter.rate = parseFloat(document.getElementById('radioSpeed').value) || 0.95;
+      utter.lang = 'en-IN';
+      utter.onend = () => {
+        if (!radioIsPlaying) return;
+        radioQueueIdx += 1;
+        speakNextChunk();
+      };
+      utter.onerror = () => {
+        if (!radioIsPlaying) return;
+        radioQueueIdx += 1;
+        speakNextChunk();
+      };
+      document.getElementById('radioStatusLine').textContent = `Playing part ${radioQueueIdx + 1}/${radioQueue.length} at ${utter.rate}x...`;
+      window.speechSynthesis.speak(utter);
     }
 
     function playRadioScript() {
@@ -742,13 +897,20 @@ Return ONLY valid JSON array of 20 objects:
         return;
       }
       if (!currentRadioScript) return;
-      stopSpeech();
-      const utter = new SpeechSynthesisUtterance(currentRadioScript);
-      utter.rate = parseFloat(document.getElementById('radioSpeed').value) || 0.95;
-      utter.lang = 'en-IN';
-      utter.onstart = () => { document.getElementById('radioStatusLine').textContent = `Playing at ${utter.rate}x speed...`; };
-      utter.onend = () => { document.getElementById('radioStatusLine').textContent = 'Briefing finished.'; };
-      window.speechSynthesis.speak(utter);
+      if (window.speechSynthesis.paused && radioIsPlaying === false && radioQueue.length > 0) {
+        radioIsPlaying = true;
+        window.speechSynthesis.resume();
+        startBgAudioAndMediaSession();
+        return;
+      }
+      window.speechSynthesis.cancel();
+      // Split into sentence chunks (~180 chars max) to prevent mobile Chrome 15s cutoff
+      radioQueue = currentRadioScript.match(/[^.!?]+[.!?]+(\s|$)|[^.!?]+$/g) || [currentRadioScript];
+      radioQueue = radioQueue.map((s) => s.trim()).filter(Boolean);
+      radioQueueIdx = 0;
+      radioIsPlaying = true;
+      startBgAudioAndMediaSession();
+      speakNextChunk();
     }
 
     function saveRadioArchive() {
@@ -776,7 +938,7 @@ Return ONLY valid JSON array of 20 objects:
     function ensureRadioLoaded() {
       const todayKey = new Date().toISOString().slice(0, 10);
       renderRadioArchiveSelect();
-      if (!radioArchive[todayKey] && apiKey.trim() && !radioAutoAttempted) {
+      if (!radioArchive[todayKey] && !radioAutoAttempted) {
         radioAutoAttempted = true;
         generateNewsRadio(true);
       }
@@ -784,8 +946,10 @@ Return ONLY valid JSON array of 20 objects:
 
     function renderRadioOutput(headline, spokenScript, sections, sources = [], dateBanner = '') {
       currentRadioScript = spokenScript;
+      const wc = spokenScript ? spokenScript.trim().split(/\s+/).length : 0;
+      const estMin = Math.max(1, Math.round(wc / 135));
       document.getElementById('radioPlayerBox').classList.remove('hidden');
-      document.getElementById('radioDateBadge').textContent = dateBanner ? `On Air · ${dateBanner}` : 'On Air · UPSC Audio Briefing';
+      document.getElementById('radioDateBadge').textContent = dateBanner ? `On Air · ${dateBanner} · ~${estMin} min (${wc} words)` : `On Air · ~${estMin} min (${wc} words)`;
       document.getElementById('radioHeadline').textContent = headline;
       document.getElementById('radioTranscriptCard').classList.remove('hidden');
       const dateHtml = dateBanner ? `<div class="p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-xs font-semibold text-amber-900">Briefing Date: ${escapeHtml(dateBanner)}</div>` : '';
@@ -813,37 +977,45 @@ Return ONLY valid JSON array of 20 objects:
         const todayKey = new Date().toISOString().slice(0, 10);
         const { articlesText, sources, rawItems } = await fetchLastTwoDaysRssNews();
         const newsBlock = articlesText ? `\n\nLIVE LAST-2-DAYS NEWS FROM GOVT & NEWSPAPER FEEDS (${rangeLabel}):\n${articlesText}` : '';
-        const prompt = `Prepare a UPSC CSE-level Daily Current Affairs Audio Briefing${topics ? ` focusing on: ${topics}` : ' covering 4 high-yield GS I–IV updates'} strictly from the last 2 days (${yesterdayStr} and ${todayStr}).${newsBlock}
-IMPORTANT FOR AUDIO: Start the spokenScript by clearly saying the date ("Here is your UPSC Daily News Radio for ${todayStr}, covering updates from ${yesterdayStr} and ${todayStr}"), and before each news story explicitly speak the article's date.
+        const prompt = `Prepare a comprehensive, minimum 15-minute UPSC CSE-level Daily Current Affairs Audio Briefing${topics ? ` focusing on: ${topics}` : ' covering 5 to 10 high-importance GS I–IV articles ranked by UPSC exam relevance'} strictly from the last 2 days (${yesterdayStr} and ${todayStr}).${newsBlock}
+IMPORTANT FOR AUDIO & DEPTH:
+1. Select 5 to 10 high-importance articles (never fewer than 5 when available) across Polity, Economy, IR, Environment, Sci-Tech, and Governance.
+2. Start the spokenScript by clearly saying the date ("Today is ${todayStr}. Here is your UPSC Daily News Radio covering updates from ${yesterdayStr} and ${todayStr}"), and before each article explicitly speak its date.
+3. Make the spokenScript thorough and unhurried (~2,000 to 2,400 words so it plays for at least 15 minutes at 0.95x pace), covering for every article: what happened, why it matters for UPSC, constitutional Articles/Acts/Committees, concrete Mains examples, and Prelims/Mains takeaways—with no markdown symbols or raw URLs.
 Return ONLY valid JSON:
 {
   "headline": "UPSC Daily News Radio",
-  "spokenScript": "Smooth, clear spoken-word radio script (450-650 words, no markdown symbols or URLs) starting with the exact date (${todayStr}), speaking each item's date aloud, and explaining what happened, constitutional/static linkages, concrete examples, and Prelims/Mains takeaways.",
+  "spokenScript": "Full 2,000-2,400 word spoken-word radio script (minimum 15 minutes at 0.95x pace) covering 5 to 10 high-importance articles with dates spoken aloud.",
   "sections": [
-    {"date": "${todayStr}", "paper": "GS Paper II · Polity", "title": "...", "explanation": "...", "linkage": "Articles / Committees / Precedents"}
+    {"date": "${todayStr}", "paper": "GS Paper II · Polity", "title": "...", "explanation": "Detailed UPSC-level analysis with examples", "linkage": "Articles / Committees / Precedents"}
   ]
 }`;
-        let parsed;
-        try {
-          const { text: raw } = await callGemini([{ text: prompt }], true, false);
-          parsed = extractJson(raw);
-        } catch (aiErr) {
+        let parsed = null;
+        if (apiKey.trim()) {
+          try {
+            const { text: raw } = await callGemini([{ text: prompt }], true, false);
+            parsed = extractJson(raw);
+          } catch (aiErr) {
+            parsed = null;
+          }
+        }
+        if (!parsed) {
           if (rawItems && rawItems.length > 0) {
-            const topItems = rawItems.slice(0, 6);
+            const topItems = rawItems.slice(0, 10);
             const spokenParts = topItems.map((it, idx) => `Update ${idx + 1}, dated ${it.date}, from ${it.source}. ${it.title}. ${it.desc}`);
             parsed = {
-              headline: 'UPSC Live Feed Radio (Quota-Free Mode)',
-              spokenScript: `Here is your UPSC Daily News Radio for ${todayStr}, covering live updates from ${yesterdayStr} and ${todayStr}. ` + spokenParts.join(' '),
+              headline: `UPSC Live Feed Radio · ${todayStr}`,
+              spokenScript: `Today is ${todayStr}. Here is your UPSC Daily News Radio covering updates from ${yesterdayStr} and ${todayStr}. ` + spokenParts.join(' '),
               sections: topItems.map((it) => ({
                 date: it.date,
                 paper: it.source,
                 title: it.title,
                 explanation: it.desc || 'Open the source link above to read the full release.',
-                linkage: 'Direct live RSS update (Gemini API quota exceeded — switched to zero-quota feed mode).'
+                linkage: 'Live Govt & Newspaper RSS Briefing (works without API key or quota).'
               }))
             };
           } else {
-            throw aiErr;
+            throw new Error('Could not reach live news feeds right now. Check your internet connection or try Sample Radio.');
           }
         }
         radioArchive[todayKey] = {
@@ -1007,8 +1179,29 @@ Return ONLY valid JSON: {"score":"e.g. 6.0 / 10","structureFeedback":"...","stre
     });
     document.getElementById('btnSampleRadio').addEventListener('click', loadSampleRadio);
     document.getElementById('btnRadioPlay').addEventListener('click', playRadioScript);
-    document.getElementById('btnRadioPause').addEventListener('click', () => { if ('speechSynthesis' in window) window.speechSynthesis.pause(); });
+    document.getElementById('btnRadioPause').addEventListener('click', pauseRadioScript);
     document.getElementById('btnRadioStop').addEventListener('click', stopSpeech);
+    function downloadCurrentRadio() {
+      if (!currentRadioScript) {
+        showToast('Generate or tap Sample Radio first.');
+        return;
+      }
+      const dateText = document.getElementById('radioDateBadge').textContent || TODAY_STR;
+      const headline = document.getElementById('radioHeadline').textContent || 'UPSC Daily News Radio';
+      const content = `${headline}\n${dateText}\n\n${currentRadioScript}\n`;
+      const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `UPSC_News_Radio_${new Date().toISOString().slice(0, 10)}.txt`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast('Briefing downloaded for offline use.');
+    }
+    document.getElementById('btnDownloadRadio').addEventListener('click', downloadCurrentRadio);
+    document.getElementById('btnDownloadRadioTop').addEventListener('click', downloadCurrentRadio);
 
     document.getElementById('evalImageInput').addEventListener('change', (e) => {
       Array.from(e.target.files || []).forEach((file) => {
