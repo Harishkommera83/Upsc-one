@@ -194,11 +194,17 @@
           </div>
         </div>
 
+        <!-- Saved Radio Dates Archive -->
+        <div id="radioArchiveRow" class="hidden flex flex-wrap items-center gap-2 text-xs">
+          <span class="font-semibold text-slate-600">Saved Briefings:</span>
+          <select id="radioDateSelect" class="px-2.5 py-1 rounded-lg border border-slate-200 bg-slate-50 font-semibold text-slate-800"></select>
+        </div>
+
         <!-- Audio Player Controls -->
         <div id="radioPlayerBox" class="hidden p-4 rounded-xl bg-indigo-950 text-white space-y-3">
-          <div class="flex items-center justify-between">
+          <div class="flex flex-wrap items-center justify-between gap-2">
             <div>
-              <div class="text-[11px] uppercase tracking-wider text-amber-300 font-bold">On Air · UPSC Audio Briefing</div>
+              <div id="radioDateBadge" class="text-[11px] uppercase tracking-wider text-amber-300 font-bold">On Air · UPSC Audio Briefing</div>
               <div id="radioHeadline" class="text-sm font-semibold mt-0.5">Ready to play</div>
             </div>
             <div class="flex items-center gap-2">
@@ -307,7 +313,7 @@
     const TODAY_STR = '2026-11-26';
     const STORAGE_KEY = 'upsc_daily_study_records_v1';
     const KEY_STORAGE = 'upsc_agent_gemini_key_v1';
-    const GEMINI_MODELS = ['gemini-4-hydrogen', 'gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite'];
+    const GEMINI_MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.8-flash', 'gemini-4-hydrogen'];
 
     const SESSIONS = [
       { id: '1', time: '6:10 – 7:30 AM', label: 'New Books / Static', minutes: 80, durationText: '1 hr 20 min', tag: 'Static' },
@@ -326,7 +332,10 @@
     let activeQuiz = [];
     let quizAnswers = {};
     let hoursChartInstance = null;
+    const RADIO_ARCHIVE_KEY = 'upsc_radio_archive_v1';
     let currentRadioScript = '';
+    let radioArchive = {};
+    let radioAutoAttempted = false;
 
     function escapeHtml(str) {
       return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -353,8 +362,16 @@
         state.records[TODAY_STR] = { completed: { '2': true, '3': true }, notes: '' };
         saveRecords();
       }
+      try {
+        const rawRadio = localStorage.getItem(RADIO_ARCHIVE_KEY);
+        if (rawRadio) {
+          const parsedRadio = JSON.parse(rawRadio);
+          if (parsedRadio && typeof parsedRadio === 'object') radioArchive = parsedRadio;
+        }
+      } catch (e) {}
       updateApiBadge();
       renderChecklistAll();
+      renderRadioArchiveSelect();
     }
 
     function saveRecords() {
@@ -382,6 +399,7 @@
         document.getElementById(`tab-${t}`).classList.toggle('hidden', t !== name);
       });
       if (name === 'checklist') renderHoursChart();
+      if (name === 'radio') ensureRadioLoaded();
     }
 
     // --- CHECKLIST ---
@@ -468,55 +486,155 @@
       });
     }
 
-    // --- GEMINI API WITH AUTOMATIC FALLBACK ---
-    async function callGemini(parts, jsonMode = false) {
+    function extractJson(text) {
+      const cleaned = String(text).replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+      try { return JSON.parse(cleaned); } catch (e) {}
+      const arrStart = cleaned.indexOf('[');
+      const objStart = cleaned.indexOf('{');
+      let start = -1, end = -1;
+      if (arrStart !== -1 && (objStart === -1 || arrStart < objStart)) {
+        start = arrStart; end = cleaned.lastIndexOf(']');
+      } else if (objStart !== -1) {
+        start = objStart; end = cleaned.lastIndexOf('}');
+      }
+      if (start !== -1 && end > start) {
+        return JSON.parse(cleaned.slice(start, end + 1));
+      }
+      throw new Error('Could not parse structured response from Gemini.');
+    }
+
+    function extractSources(data) {
+      const chunks = data?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+      const seen = new Set();
+      const out = [];
+      chunks.forEach((c) => {
+        const uri = c?.web?.uri;
+        const title = c?.web?.title || uri;
+        if (uri && !seen.has(uri)) {
+          seen.add(uri);
+          out.push({ title, uri });
+        }
+      });
+      return out.slice(0, 8);
+    }
+
+    // --- GEMINI API WITH LIVE GOOGLE SEARCH GROUNDING & AUTOMATIC FALLBACK ---
+    async function callGemini(parts, jsonMode = false, useSearch = true) {
       if (!apiKey.trim()) {
         document.getElementById('settingsModal').classList.remove('hidden');
         throw new Error('Please add your Gemini API key first (or use Sample mode).');
       }
-      const body = { contents: [{ role: 'user', parts }] };
-      if (jsonMode) body.generationConfig = { responseMimeType: 'application/json' };
+      const makeBody = (withSearch) => {
+        const b = { contents: [{ role: 'user', parts }] };
+        if (withSearch) {
+          b.tools = [{ google_search: {} }];
+        } else if (jsonMode) {
+          b.generationConfig = { responseMimeType: 'application/json' };
+        }
+        return b;
+      };
 
       let lastErr = 'All Gemini models are currently busy. Please try again in a moment.';
       for (let i = 0; i < GEMINI_MODELS.length; i++) {
         const model = GEMINI_MODELS[i];
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey.trim())}`;
-        try {
-          const res = await fetch(url, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
-          });
-          const data = await res.json();
-          if (res.ok) {
-            const txt = data.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (txt) return txt;
+        for (const attemptSearch of (useSearch ? [true, false] : [false])) {
+          try {
+            const res = await fetch(url, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(makeBody(attemptSearch))
+            });
+            const data = await res.json();
+            if (res.ok) {
+              const txt = data.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+              if (txt) return { text: txt, sources: extractSources(data) };
+            }
+            const msg = (data.error && data.error.message) || `HTTP ${res.status}`;
+            lastErr = msg;
+            if (attemptSearch && res.status === 400) continue; // Retry same model without search tool if 400
+            if (res.status === 503 || res.status === 429 || res.status === 404 || /high demand|overloaded|unavailable/i.test(msg)) {
+              await new Promise((r) => setTimeout(r, 500));
+              break; // Try next model
+            }
+            throw new Error(msg);
+          } catch (err) {
+            lastErr = err.message || lastErr;
           }
-          const msg = (data.error && data.error.message) || `HTTP ${res.status}`;
-          lastErr = msg;
-          // Retry next fallback model on high demand (503), rate limit (429), or unavailable model (404/400)
-          if (res.status === 503 || res.status === 429 || res.status === 404 || /high demand|overloaded|unavailable/i.test(msg)) {
-            await new Promise((r) => setTimeout(r, 500));
-            continue;
-          }
-          throw new Error(msg);
-        } catch (err) {
-          lastErr = err.message || lastErr;
         }
       }
       throw new Error(lastErr);
     }
 
+    async function fetchLastTwoDaysRssNews() {
+      const feeds = [
+        { name: 'PIB (Govt of India)', url: 'https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=3' },
+        { name: 'PRS India (Parliament & Bills)', url: 'https://prsindia.org/rss.xml' },
+        { name: 'AIR News (All India Radio)', url: 'https://newsonair.gov.in/Nsd_RssFeed.aspx?cat=National' },
+        { name: 'RBI (Reserve Bank of India)', url: 'https://www.rbi.org.in/pressreleases_rss.xml' },
+        { name: 'The Hindu (National)', url: 'https://www.thehindu.com/news/national/feeder/default.rss' },
+        { name: 'The Hindu (Editorial)', url: 'https://www.thehindu.com/opinion/editorial/feeder/default.rss' },
+        { name: 'Indian Express (Explained)', url: 'https://indianexpress.com/section/explained/feed/' },
+        { name: 'Indian Express (India)', url: 'https://indianexpress.com/section/india/feed/' }
+      ];
+      const cutoff = Date.now() - 2 * 86400000;
+      const items = [];
+      const sources = [];
+      const seenLinks = new Set();
+
+      await Promise.all(feeds.map(async (f) => {
+        try {
+          const res = await fetch(`https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(f.url)}`);
+          if (!res.ok) return;
+          const data = await res.json();
+          (data.items || []).forEach((it) => {
+            const ts = Date.parse(it.pubDate || '');
+            if (!isNaN(ts) && ts >= cutoff && !seenLinks.has(it.link)) {
+              seenLinks.add(it.link);
+              const cleanDesc = String(it.description || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 260);
+              const dateLabel = new Date(ts).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+              items.push({ source: f.name, date: dateLabel, title: it.title, desc: cleanDesc, link: it.link, ts });
+            }
+          });
+        } catch (e) {}
+      }));
+
+      items.sort((a, b) => b.ts - a.ts);
+      const top = items.slice(0, 12);
+      top.forEach((x) => sources.push({ title: `${x.source} (${x.date})`, uri: x.link }));
+      const articlesText = top.map((x, i) => `${i + 1}. [${x.date}] (${x.source}) ${x.title} — ${x.desc}`).join('\n');
+      return { articlesText, sources, rawItems: top };
+    }
+
+    function getLastTwoDays() {
+      const now = new Date();
+      const yest = new Date(now.getTime() - 86400000);
+      const fmt = (d) => d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+      return { todayStr: fmt(now), yesterdayStr: fmt(yest), rangeLabel: `${fmt(yest)} – ${fmt(now)}` };
+    }
+
     // --- PRELIMS QUIZ ---
-    function renderQuizQuestions() {
+    function renderQuizQuestions(sources = [], dateBanner = '') {
       const container = document.getElementById('quizContainer');
       container.innerHTML = '';
+      if (dateBanner || sources.length) {
+        const srcBox = document.createElement('div');
+        srcBox.className = 'bg-white rounded-2xl border border-slate-200 p-3.5 shadow-sm text-xs text-slate-600 space-y-1';
+        const dHtml = dateBanner ? `<div class="font-bold text-indigo-800">Current Affairs Window: ${escapeHtml(dateBanner)}</div>` : '';
+        const sHtml = sources.length ? `<div><span class="font-bold text-slate-800">Live Web Sources: </span>${sources.map((s) => `<a href="${escapeHtml(s.uri)}" target="_blank" rel="noopener noreferrer" class="text-indigo-700 underline mr-2.5">${escapeHtml(s.title)}</a>`).join('')}</div>` : '';
+        srcBox.innerHTML = dHtml + sHtml;
+        container.appendChild(srcBox);
+      }
       updateQuizScore();
       activeQuiz.forEach((item, idx) => {
         const card = document.createElement('div');
         card.className = 'bg-white rounded-2xl border border-slate-200 p-4 shadow-sm space-y-2.5';
+        const dateBadge = item.date ? `<span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-indigo-50 text-indigo-700">${escapeHtml(item.date)}</span>` : '';
         card.innerHTML = `
-          <div class="flex items-center justify-between gap-2">
+          <div class="flex flex-wrap items-center justify-between gap-2">
             <span class="text-xs font-bold text-indigo-700">Question ${idx + 1} of ${activeQuiz.length}</span>
-            <span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-slate-100 text-slate-600">${escapeHtml(item.tag || 'UPSC Prelims')}</span>
+            <div class="flex items-center gap-1.5">
+              ${dateBadge}
+              <span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-slate-100 text-slate-600">${escapeHtml(item.tag || 'UPSC Prelims')}</span>
+            </div>
           </div>
           <div class="text-sm font-semibold text-slate-900 whitespace-pre-line">${escapeHtml(item.q)}</div>
         `;
@@ -566,14 +684,18 @@
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span> Generating...';
       try {
-        const prompt = `Generate a 20-question UPSC CSE Prelims GS Paper I mock set${theme ? ` focused on "${theme}"` : ' blending Polity, Economy, Environment, Modern/Ancient History, Geography, Sci-Tech & Current Affairs'}. Match real UPSC Prelims difficulty (multi-statement, Statement-I/II, "how many pairs" elimination).
+        const { todayStr, yesterdayStr, rangeLabel } = getLastTwoDays();
+        const { articlesText, sources } = await fetchLastTwoDaysRssNews();
+        const newsBlock = articlesText ? `\n\nLIVE LAST-2-DAYS NEWS FEED (${rangeLabel}):\n${articlesText}` : '';
+        const prompt = `Generate a 20-question UPSC CSE Prelims GS Paper I mock set${theme ? ` focused on "${theme}"` : ''} blending the live last-2-days current affairs below (${yesterdayStr} to ${todayStr}) with static UPSC PYQ-style questions (multi-statement, Statement-I/II, "how many pairs" elimination).${newsBlock}
+For each question, include a "date" field showing the exact news date (${todayStr} or ${yesterdayStr}) for current affairs items, or "Static / PYQ" for static items.
 Return ONLY valid JSON array of 20 objects:
-[{"tag":"Polity / PYQ-style","q":"...","options":["A. ...","B. ...","C. ...","D. ..."],"answerIndex":0,"explanation":"..."}]`;
-        const raw = await callGemini([{ text: prompt }], true);
-        activeQuiz = JSON.parse(raw);
+[{"date":"${todayStr}","tag":"Polity / Current Affairs","q":"...","options":["A. ...","B. ...","C. ...","D. ..."],"answerIndex":0,"explanation":"..."}]`;
+        const { text: raw } = await callGemini([{ text: prompt }], true, false);
+        activeQuiz = extractJson(raw);
         quizAnswers = {};
-        renderQuizQuestions();
-        showToast('20-MCQ UPSC Prelims set ready!');
+        renderQuizQuestions(sources, rangeLabel);
+        showToast(`20-MCQ set ready (${rangeLabel})!`);
       } catch (e) {
         showToast(e.message || 'Could not generate quiz.');
       } finally {
@@ -629,14 +751,51 @@ Return ONLY valid JSON array of 20 objects:
       window.speechSynthesis.speak(utter);
     }
 
-    function renderRadioOutput(headline, spokenScript, sections) {
+    function saveRadioArchive() {
+      try { localStorage.setItem(RADIO_ARCHIVE_KEY, JSON.stringify(radioArchive)); } catch (e) {}
+    }
+
+    function renderRadioArchiveSelect(selectedKey = '') {
+      const keys = Object.keys(radioArchive).sort((a, b) => b.localeCompare(a));
+      const row = document.getElementById('radioArchiveRow');
+      const sel = document.getElementById('radioDateSelect');
+      if (!keys.length) {
+        row.classList.add('hidden');
+        return;
+      }
+      row.classList.remove('hidden');
+      sel.innerHTML = keys.map((k) => `<option value="${k}">${escapeHtml(radioArchive[k].displayDate || k)}</option>`).join('');
+      const target = selectedKey && radioArchive[selectedKey] ? selectedKey : keys[0];
+      sel.value = target;
+      const item = radioArchive[target];
+      if (item) {
+        renderRadioOutput(item.headline, item.spokenScript, item.sections, item.sources || [], item.displayDate || target);
+      }
+    }
+
+    function ensureRadioLoaded() {
+      const todayKey = new Date().toISOString().slice(0, 10);
+      renderRadioArchiveSelect();
+      if (!radioArchive[todayKey] && apiKey.trim() && !radioAutoAttempted) {
+        radioAutoAttempted = true;
+        generateNewsRadio(true);
+      }
+    }
+
+    function renderRadioOutput(headline, spokenScript, sections, sources = [], dateBanner = '') {
       currentRadioScript = spokenScript;
       document.getElementById('radioPlayerBox').classList.remove('hidden');
+      document.getElementById('radioDateBadge').textContent = dateBanner ? `On Air · ${dateBanner}` : 'On Air · UPSC Audio Briefing';
       document.getElementById('radioHeadline').textContent = headline;
       document.getElementById('radioTranscriptCard').classList.remove('hidden');
-      document.getElementById('radioTranscriptBody').innerHTML = (sections || []).map((sec) => `
+      const dateHtml = dateBanner ? `<div class="p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-xs font-semibold text-amber-900">Briefing Date: ${escapeHtml(dateBanner)}</div>` : '';
+      const srcHtml = sources.length ? `<div class="p-3 rounded-xl bg-indigo-50/60 border border-indigo-100 text-xs text-slate-700"><strong>Live Web Sources: </strong>${sources.map((s) => `<a href="${escapeHtml(s.uri)}" target="_blank" rel="noopener noreferrer" class="text-indigo-700 underline mr-2.5">${escapeHtml(s.title)}</a>`).join('')}</div>` : '';
+      document.getElementById('radioTranscriptBody').innerHTML = dateHtml + srcHtml + (sections || []).map((sec) => `
         <div class="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-1">
-          <div class="text-xs font-bold uppercase text-indigo-700">${escapeHtml(sec.paper)}</div>
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <span class="text-xs font-bold uppercase text-indigo-700">${escapeHtml(sec.paper)}</span>
+            ${sec.date ? `<span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-indigo-100 text-indigo-800">${escapeHtml(sec.date)}</span>` : ''}
+          </div>
           <div class="font-bold text-slate-900">${escapeHtml(sec.title)}</div>
           <p class="text-slate-700">${escapeHtml(sec.explanation)}</p>
           <div class="text-xs text-slate-500 pt-1"><strong>UPSC Linkage:</strong> ${escapeHtml(sec.linkage)}</div>
@@ -644,27 +803,62 @@ Return ONLY valid JSON array of 20 objects:
       `).join('');
     }
 
-    async function generateNewsRadio() {
+    async function generateNewsRadio(isAuto = false) {
       const topics = document.getElementById('radioTopicInput').value.trim();
       const btn = document.getElementById('btnGenRadio');
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span> Preparing...';
       try {
-        const prompt = `Prepare a UPSC CSE-level Daily Current Affairs Audio Briefing${topics ? ` covering: ${topics}` : ' covering 4 high-yield GS I–IV themes (Polity/Governance, Economy, Environment/IR, Sci-Tech)'}.
+        const { todayStr, yesterdayStr, rangeLabel } = getLastTwoDays();
+        const todayKey = new Date().toISOString().slice(0, 10);
+        const { articlesText, sources, rawItems } = await fetchLastTwoDaysRssNews();
+        const newsBlock = articlesText ? `\n\nLIVE LAST-2-DAYS NEWS FROM GOVT & NEWSPAPER FEEDS (${rangeLabel}):\n${articlesText}` : '';
+        const prompt = `Prepare a UPSC CSE-level Daily Current Affairs Audio Briefing${topics ? ` focusing on: ${topics}` : ' covering 4 high-yield GS I–IV updates'} strictly from the last 2 days (${yesterdayStr} and ${todayStr}).${newsBlock}
+IMPORTANT FOR AUDIO: Start the spokenScript by clearly saying the date ("Here is your UPSC Daily News Radio for ${todayStr}, covering updates from ${yesterdayStr} and ${todayStr}"), and before each news story explicitly speak the article's date.
 Return ONLY valid JSON:
 {
-  "headline": "Short title for today's briefing",
-  "spokenScript": "Smooth, clear spoken-word radio script (400-600 words, no markdown symbols or URLs) explaining what happened, constitutional/static linkages, concrete examples, and Prelims/Mains takeaways.",
+  "headline": "UPSC Daily News Radio",
+  "spokenScript": "Smooth, clear spoken-word radio script (450-650 words, no markdown symbols or URLs) starting with the exact date (${todayStr}), speaking each item's date aloud, and explaining what happened, constitutional/static linkages, concrete examples, and Prelims/Mains takeaways.",
   "sections": [
-    {"paper": "GS Paper II · Polity", "title": "...", "explanation": "...", "linkage": "Articles / Committees / Precedents"}
+    {"date": "${todayStr}", "paper": "GS Paper II · Polity", "title": "...", "explanation": "...", "linkage": "Articles / Committees / Precedents"}
   ]
 }`;
-        const raw = await callGemini([{ text: prompt }], true);
-        const parsed = JSON.parse(raw);
-        renderRadioOutput(parsed.headline, parsed.spokenScript, parsed.sections);
-        showToast('UPSC News Radio briefing ready!');
+        let parsed;
+        try {
+          const { text: raw } = await callGemini([{ text: prompt }], true, false);
+          parsed = extractJson(raw);
+        } catch (aiErr) {
+          if (rawItems && rawItems.length > 0) {
+            const topItems = rawItems.slice(0, 6);
+            const spokenParts = topItems.map((it, idx) => `Update ${idx + 1}, dated ${it.date}, from ${it.source}. ${it.title}. ${it.desc}`);
+            parsed = {
+              headline: 'UPSC Live Feed Radio (Quota-Free Mode)',
+              spokenScript: `Here is your UPSC Daily News Radio for ${todayStr}, covering live updates from ${yesterdayStr} and ${todayStr}. ` + spokenParts.join(' '),
+              sections: topItems.map((it) => ({
+                date: it.date,
+                paper: it.source,
+                title: it.title,
+                explanation: it.desc || 'Open the source link above to read the full release.',
+                linkage: 'Direct live RSS update (Gemini API quota exceeded — switched to zero-quota feed mode).'
+              }))
+            };
+          } else {
+            throw aiErr;
+          }
+        }
+        radioArchive[todayKey] = {
+          dateKey: todayKey,
+          displayDate: `${todayStr} (${rangeLabel})`,
+          headline: parsed.headline,
+          spokenScript: parsed.spokenScript,
+          sections: parsed.sections,
+          sources
+        };
+        saveRadioArchive();
+        renderRadioArchiveSelect(todayKey);
+        if (!isAuto) showToast(`UPSC News Radio saved for ${todayStr}!`);
       } catch (e) {
-        showToast(e.message || 'Could not generate radio briefing.');
+        if (!isAuto) showToast(e.message || 'Could not generate radio briefing.');
       } finally {
         btn.disabled = false;
         btn.textContent = 'Generate Briefing';
@@ -736,6 +930,7 @@ Return ONLY valid JSON:
         </div>
         <div class="p-3 rounded-xl bg-indigo-50/60 border border-indigo-100"><div class="text-xs font-bold text-indigo-900 uppercase mb-1">Topper Value Additions</div>${ul(r.valueAdditions)}</div>
         <div class="p-3 rounded-xl bg-slate-50 border border-slate-100"><strong>Model Intro &amp; Way Forward:</strong> ${escapeHtml(r.modelFramework || '')}</div>
+        ${(r.sources && r.sources.length) ? `<div class="p-3 rounded-xl bg-indigo-50/50 border border-indigo-100 text-xs"><strong>Verified Web Sources: </strong>${r.sources.map((s) => `<a href="${escapeHtml(s.uri)}" target="_blank" rel="noopener noreferrer" class="text-indigo-700 underline mr-2.5">${escapeHtml(s.title)}</a>`).join('')}</div>` : ''}
       `;
     }
 
@@ -761,9 +956,9 @@ Return ONLY valid JSON: {"score":"e.g. 6.0 / 10","structureFeedback":"...","stre
           parts.push({ text: `[Answer Page ${i + 1}]` });
           parts.push({ inlineData: { mimeType: img.mimeType, data: img.base64 } });
         });
-        const raw = await callGemini(parts, true);
-        renderEvaluationResult({ paper, marks, ...JSON.parse(raw) });
-        showToast('Evaluation complete!');
+        const { text: raw, sources } = await callGemini(parts, true, false);
+        renderEvaluationResult({ paper, marks, sources, ...extractJson(raw) });
+        showToast('Evaluation complete (web-grounded)!');
       } catch (e) {
         showToast(e.message || 'Evaluation failed.');
       } finally {
@@ -806,7 +1001,10 @@ Return ONLY valid JSON: {"score":"e.g. 6.0 / 10","structureFeedback":"...","stre
 
     document.getElementById('btnGenQuiz20').addEventListener('click', generatePrelims20);
     document.getElementById('btnSampleQuiz').addEventListener('click', loadSampleQuiz);
-    document.getElementById('btnGenRadio').addEventListener('click', generateNewsRadio);
+    document.getElementById('btnGenRadio').addEventListener('click', () => generateNewsRadio(false));
+    document.getElementById('radioDateSelect').addEventListener('change', (e) => {
+      renderRadioArchiveSelect(e.target.value);
+    });
     document.getElementById('btnSampleRadio').addEventListener('click', loadSampleRadio);
     document.getElementById('btnRadioPlay').addEventListener('click', playRadioScript);
     document.getElementById('btnRadioPause').addEventListener('click', () => { if ('speechSynthesis' in window) window.speechSynthesis.pause(); });
